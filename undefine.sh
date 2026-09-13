@@ -9,7 +9,10 @@ if ! virsh dominfo "$VM_NAME" >/dev/null 2>&1; then
   exit 0
 fi
 
-virsh shutdown "$VM_NAME"
+# 仅在虚拟机运行时才发送关机指令，避免 "domain is not running" 报错
+if [[ "$(virsh domstate "$VM_NAME" 2>/dev/null || true)" == "running" ]]; then
+  virsh shutdown "$VM_NAME"
+fi
 
 # 轮询确认虚拟机真正关机（最长等待 120 秒）
 state=""
