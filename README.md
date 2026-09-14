@@ -51,7 +51,10 @@ Linux desktop or server running libvirt.
 
 - **One-command deployment** — provision a complete VM with `bash install.sh`.
 - **Idempotent re-runs** — an existing VM with the same name is gracefully shut
-  down and undefined (including its storage) before a fresh one is created.
+  down and undefined (including its snapshots, NVRAM, storage, and files left
+  behind by external snapshots) before a fresh one is created.
+- **UEFI by default** — boots with UEFI when libvirt can find an OVMF firmware
+  descriptor, and automatically falls back to legacy BIOS when OVMF is missing.
 - **cloud-init automation (NoCloud datasource)** — no interactive installation:
   - creates a sudo user (`cliff`) with passwordless `sudo`;
   - sets passwords for the user and `root`, enables SSH password authentication
@@ -86,8 +89,11 @@ Linux desktop or server running libvirt.
 ```
 
 1. `install.sh` first calls `undefine.sh`, which shuts down any existing VM
-   with the target name (waiting up to 120 seconds) and runs
-   `virsh undefine --remove-all-storage`.
+   with the target name (waiting up to 120 seconds), deletes its snapshot
+   metadata, and runs `virsh undefine --nvram --remove-all-storage`. Files
+   left behind by external snapshots (disk overlays, memory-state files, and
+   backing-chain base images not managed by libvirt) are collected beforehand
+   and removed afterwards.
 2. `genisoimage` packs `meta-data`, `network-config`, and `user-data` into
    `cidata.iso` with the `cidata` volume label, which the cloud-init
    **NoCloud** datasource recognises at boot.
@@ -95,14 +101,16 @@ Linux desktop or server running libvirt.
    `/var/lib/libvirt/images/` (the default libvirt storage pool).
 4. If `--capacity` is given, `qemu-img resize` enlarges the copied qcow2 image.
 5. `virt-install --import` boots the image directly with the seed ISO attached
-   as a SATA CD-ROM. cloud-init runs on first boot and applies all settings.
+   as a SATA CD-ROM. UEFI is used whenever an OVMF firmware descriptor exists
+   (libvirt selects OVMF automatically); otherwise the script falls back to
+   legacy BIOS. cloud-init runs on first boot and applies all settings.
 
 ## Project Structure
 
 ```
 rocky-init/
 ├── install.sh        # Main provisioning script (arguments + virt-install)
-├── undefine.sh       # Gracefully shuts down and removes an existing VM
+├── undefine.sh       # Gracefully shuts down, deletes snapshots and removes an existing VM
 ├── user-data         # cloud-init cloud-config: users, passwords, packages, runcmd
 ├── meta-data         # cloud-init instance-id and local hostname
 ├── network-config    # cloud-init network config version 2 (static IP)
@@ -113,7 +121,7 @@ rocky-init/
 | File | Format | Purpose |
 | --- | --- | --- |
 | `install.sh` | Bash | Parses arguments, builds the seed ISO, copies/resizes the image, creates the VM |
-| `undefine.sh` | Bash | Safely powers off and undefines a VM, removing all of its storage |
+| `undefine.sh` | Bash | Safely powers off, deletes snapshots, and undefines a VM together with its NVRAM, storage, and external-snapshot leftover files |
 | `user-data` | cloud-config | User accounts, passwords, packages, first-boot commands |
 | `meta-data` | YAML | `instance-id` and `local-hostname` |
 | `network-config` | YAML v2 | Static IP, gateway, and DNS servers for the VM |
@@ -132,6 +140,8 @@ rocky-init/
   - `qemu-img` (QEMU disk utilities),
   - `sudo`.
 - The libvirt **`default`** NAT network active (subnet `192.168.122.0/24`).
+- (Optional, for UEFI boot) OVMF firmware. Without it `install.sh` prints a
+  warning and falls back to legacy BIOS.
 - The official Rocky Linux 10 GenericCloud qcow2 image downloaded to
   `~/OS/` (the filename must match `IMG_FILENAME` in `install.sh`).
 
@@ -247,12 +257,23 @@ virsh console Rocky-Linux     # exit the console with Ctrl + ]
 bash undefine.sh [VM_NAME]
 ```
 
-Shuts down an existing VM gracefully (`virsh shutdown`), polls its state for
-up to 120 seconds, then removes it together with all associated storage
-(`virsh undefine --remove-all-storage`). If the VM does not power off within
-120 seconds the script aborts rather than forcing destruction. Defaults to
-`Rocky-Linux` when no name is given. `install.sh` invokes this script
-automatically, so it is normally used only for manual cleanup.
+Shuts down an existing VM gracefully (`virsh shutdown`) and polls its state
+for up to 120 seconds. It then:
+
+1. collects the external-snapshot files referenced by the domain and snapshot
+   XML — disk overlays, memory-state files — and follows each qcow2 backing
+   file chain to include the base image;
+2. deletes all snapshot metadata with `virsh snapshot-delete`;
+3. runs `virsh undefine --nvram --remove-all-storage` (the `--nvram` flag is
+   mandatory for UEFI VMs, otherwise libvirt refuses with
+   `cannot undefine domain with nvram`);
+4. removes any files not managed by the storage pool, using
+   `virsh vol-delete` first and `sudo rm` as a fallback.
+
+If the VM does not power off within 120 seconds the script aborts rather than
+forcing destruction. Defaults to `Rocky-Linux` when no name is given.
+`install.sh` invokes this script automatically, so it is normally used only
+for manual cleanup.
 
 ### Logging in to the VM
 
@@ -330,7 +351,9 @@ edited there:
 
 - `--memory 6144` — 6 GiB RAM,
 - `--vcpus 6` — 6 vCPUs,
-- `--os-variant almalinux10` — closest OS variant for Rocky Linux 10.
+- `--boot uefi` — used when an OVMF firmware descriptor is found; the script
+  automatically switches to `--boot bios` otherwise,
+- `--os-variant rocky10` — OS variant for Rocky Linux 10.
 
 > **Single-instance note:** every run copies the image to the same fixed path
 > in `/var/lib/libvirt/images/`. The project is therefore designed around one
@@ -347,10 +370,11 @@ edited there:
 | Memory | 6144 MiB |
 | vCPUs | 6 |
 | Disk bus / NIC model | virtio / virtio |
+| Firmware | UEFI (OVMF auto-selected by libvirt); legacy BIOS fallback |
 | Cloud-init datasource | NoCloud (`cidata.iso` on a SATA CD-ROM) |
 | Network | static `192.168.122.11/24`, gateway `.1` |
 | Default user | `cliff` (passwordless sudo) |
-| OS variant | `almalinux10` |
+| OS variant | `rocky10` |
 
 ## Troubleshooting
 
@@ -380,6 +404,22 @@ edited there:
   `undefine.sh` aborts on purpose. Check `virsh domstate <name>`; if the guest
   is unresponsive, force it off with `virsh destroy <name>` and run the script
   again.
+
+- **`cannot undefine domain with nvram`**
+  The VM uses UEFI and libvirt requires an explicit `--nvram`. `undefine.sh`
+  already passes it; if you run `virsh undefine` manually, add `--nvram`.
+
+- **`Storage volume '...' is not managed by libvirt. Remove it manually.`**
+  This file comes from an external snapshot (a disk overlay or memory-state
+  file). `undefine.sh` now collects and removes such files automatically; if
+  an earlier interrupted run left one behind, delete it with
+  `virsh vol-delete <path>` (or `sudo rm <path>`) and verify with
+  `virsh vol-list default`.
+
+- **`警告：未找到 OVMF UEFI 固件，回退到 BIOS 启动` / VM boots in BIOS mode**
+  Install OVMF (`ovmf` on Debian/Ubuntu, `edk2-ovmf` on Fedora/Rocky Linux)
+  if you want UEFI; the warning itself is harmless and the VM continues with
+  legacy BIOS.
 
 - **Disk size did not change inside the guest**
   `--capacity` grows the qcow2 file; the partition/LVM/XFS expansion is
@@ -477,8 +517,10 @@ redistribute it, please contact the maintainer to add an appropriate license
 ## 功能特性
 
 - **一键部署**：执行 `bash install.sh` 即可完成整台虚拟机的交付。
-- **可重复执行**：创建前会先将同名虚拟机正常关机并 undefine（同时删除其存储），
-  随后创建全新实例。
+- **可重复执行**：创建前会先将同名虚拟机正常关机并 undefine（同时删除快照、
+  NVRAM、存储以及外部快照遗留的文件），随后创建全新实例。
+- **默认 UEFI 启动**：libvirt 能找到 OVMF 固件描述符时使用 UEFI 启动，缺少
+  OVMF 时自动回退到传统 BIOS。
 - **cloud-init 自动化（NoCloud 数据源）**，全程无需交互：
   - 创建具备免密 `sudo` 权限的用户（`cliff`）；
   - 设置普通用户与 `root` 密码，开启 SSH 密码登录与 root 登录；
@@ -511,22 +553,26 @@ redistribute it, please contact the maintainer to add an appropriate license
 ```
 
 1. `install.sh` 首先调用 `undefine.sh`：若存在同名虚拟机，先优雅关机
-   （最长等待 120 秒），再执行 `virsh undefine --remove-all-storage`。
+   （最长等待 120 秒）、删除其快照元数据，再执行
+   `virsh undefine --nvram --remove-all-storage`。外部快照遗留的文件
+   （磁盘 overlay、内存状态文件，以及不受 libvirt 管理的 backing file 链
+   基础镜像）会在关机后先登记、undefine 后统一删除。
 2. `genisoimage` 将 `meta-data`、`network-config`、`user-data` 打包为卷标为
    `cidata` 的 `cidata.iso`，cloud-init 的 **NoCloud** 数据源在启动时会自动
    识别该光盘。
 3. 将 GenericCloud qcow2 镜像与 `cidata.iso` 复制到 libvirt 默认存储池
    `/var/lib/libvirt/images/`。
 4. 若指定了 `--capacity`，通过 `qemu-img resize` 扩容复制后的 qcow2 镜像。
-5. `virt-install --import` 将种子 ISO 作为 SATA 光驱挂载并直接启动镜像；
-   cloud-init 在首次启动时应用全部配置。
+5. `virt-install --import` 将种子 ISO 作为 SATA 光驱挂载并直接启动镜像。
+   存在 OVMF 固件描述符时使用 UEFI（由 libvirt 自动选择 OVMF），否则脚本
+   回退到传统 BIOS；cloud-init 在首次启动时应用全部配置。
 
 ## 项目结构
 
 ```
 rocky-init/
 ├── install.sh        # 主部署脚本（参数解析 + virt-install）
-├── undefine.sh       # 优雅关闭并删除已有虚拟机
+├── undefine.sh       # 优雅关机、删除快照并删除已有虚拟机
 ├── user-data         # cloud-init cloud-config：用户、密码、软件包、runcmd
 ├── meta-data         # cloud-init 实例 ID 与本地主机名
 ├── network-config    # cloud-init 网络配置 v2（静态 IP）
@@ -537,7 +583,7 @@ rocky-init/
 | 文件 | 格式 | 用途 |
 | --- | --- | --- |
 | `install.sh` | Bash | 解析参数、生成种子 ISO、复制/扩容镜像、创建虚拟机 |
-| `undefine.sh` | Bash | 安全关机并 undefine 虚拟机，同时删除其全部存储 |
+| `undefine.sh` | Bash | 安全关机、删除快照，并 undefine 虚拟机及其 NVRAM、存储和外部快照遗留文件 |
 | `user-data` | cloud-config | 用户账户、密码、软件包、首次启动命令 |
 | `meta-data` | YAML | `instance-id` 与 `local-hostname` |
 | `network-config` | YAML v2 | 虚拟机的静态 IP、网关与 DNS |
@@ -557,6 +603,8 @@ rocky-init/
   - `sudo`。
 - libvirt 的 **`default`** NAT 网络处于活动状态（网段
   `192.168.122.0/24`）。
+- （可选，UEFI 启动需要）OVMF 固件。未安装时 `install.sh` 会给出警告并
+  回退到传统 BIOS。
 - 已下载官方 Rocky Linux 10 GenericCloud qcow2 镜像到 `~/OS/` 目录，
   且文件名与 `install.sh` 中的 `IMG_FILENAME` 一致。
 
@@ -670,9 +718,17 @@ virsh console Rocky-Linux     # 按 Ctrl + ] 退出控制台
 bash undefine.sh [虚拟机名称]
 ```
 
-先优雅关闭虚拟机（`virsh shutdown`），最长轮询等待 120 秒，待其真正关机后
-执行 `virsh undefine --remove-all-storage`，连同所有关联存储一并删除。若
-120 秒内未能关机，脚本将中止而不会强制销毁。未传名称时默认为
+先优雅关闭虚拟机（`virsh shutdown`），并轮询状态最长 120 秒。随后依次：
+
+1. 从域 XML 与快照 XML 中登记外部快照文件——磁盘 overlay、内存状态文件，
+   并沿 qcow2 backing file 链追出基础镜像；
+2. 通过 `virsh snapshot-delete` 删除全部快照元数据；
+3. 执行 `virsh undefine --nvram --remove-all-storage`（UEFI 虚拟机必须带
+   `--nvram`，否则 libvirt 会报 `cannot undefine domain with nvram`）；
+4. 对不受存储池管理的遗留文件，优先用 `virsh vol-delete` 删除，失败时
+   以 `sudo rm` 兜底。
+
+若 120 秒内未能关机，脚本将中止而不会强制销毁。未传名称时默认为
 `Rocky-Linux`。`install.sh` 会自动调用该脚本，通常只在手动清理时单独使用。
 
 ### 登录虚拟机
@@ -749,7 +805,9 @@ libvirt `default` 网络的网段内。
 
 - `--memory 6144`：6 GiB 内存；
 - `--vcpus 6`：6 个 vCPU；
-- `--os-variant almalinux10`：与 Rocky Linux 10 最匹配的操作系统变体。
+- `--boot uefi`：找到 OVMF 固件描述符时使用；否则脚本自动改用
+  `--boot bios`；
+- `--os-variant rocky10`：Rocky Linux 10 对应的操作系统变体。
 
 > **单实例说明**：每次运行都会把镜像复制到 `/var/lib/libvirt/images/` 下
 > 同一个固定路径，因此本项目的设计是同一时间只运行一台虚拟机。若需同时保留
@@ -765,10 +823,11 @@ libvirt `default` 网络的网段内。
 | 内存 | 6144 MiB |
 | vCPU | 6 |
 | 磁盘总线 / 网卡型号 | virtio / virtio |
+| 固件 | UEFI（由 libvirt 自动选择 OVMF），缺失时回退传统 BIOS |
 | cloud-init 数据源 | NoCloud（SATA 光驱中的 `cidata.iso`） |
 | 网络 | 静态地址 `192.168.122.11/24`，网关 `.1` |
 | 默认用户 | `cliff`（免密 sudo） |
-| 操作系统变体 | `almalinux10` |
+| 操作系统变体 | `rocky10` |
 
 ## 常见问题
 
@@ -796,6 +855,20 @@ libvirt `default` 网络的网段内。
 - **虚拟机 120 秒内未能关闭**
   `undefine.sh` 会因此主动中止。可通过 `virsh domstate <名称>` 检查状态；
   若客户机确实无响应，使用 `virsh destroy <名称>` 强制关机后重新运行脚本。
+
+- **报错 `cannot undefine domain with nvram`**
+  虚拟机使用 UEFI，libvirt 要求显式指定 `--nvram`。`undefine.sh` 已自带该
+  参数；若手动执行 `virsh undefine`，请自行加上 `--nvram`。
+
+- **报错 `Storage volume '...' is not managed by libvirt. Remove it manually.`**
+  该文件来自外部快照（磁盘 overlay 或内存状态文件）。`undefine.sh` 现在会
+  自动登记并删除这类文件；若之前中断的运行留下残留，可手动执行
+  `virsh vol-delete <路径>`（或 `sudo rm <路径>`），再用
+  `virsh vol-list default` 核对。
+
+- **提示 `警告：未找到 OVMF UEFI 固件，回退到 BIOS 启动` / 虚拟机以 BIOS 启动**
+  如需 UEFI，请安装 OVMF（Debian/Ubuntu 为 `ovmf`，Fedora/Rocky Linux 为
+  `edk2-ovmf`）；该警告本身无害，虚拟机会继续以传统 BIOS 启动。
 
 - **客户机内部磁盘容量未变化**
   `--capacity` 只扩大 qcow2 文件；分区/LVM/XFS 扩展由 `user-data` 中的
