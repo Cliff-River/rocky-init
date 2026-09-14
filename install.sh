@@ -60,7 +60,7 @@ fi
 
 sudo virt-install \
   --name "$VM_NAME" \
-  --os-variant almalinux10 \
+  --os-variant rocky10 \
   --memory 6144 \
   --vcpus 6 \
   --disk path="$IMG_LIBVIRT_PATH",format=qcow2,bus=virtio \

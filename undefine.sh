@@ -28,5 +28,15 @@ if [[ "$state" != "shut off" ]]; then
   exit 1
 fi
 
+# 删除虚拟机前先清理所有快照，否则 undefine 会失败
+if snapshot_list=$(virsh snapshot-list "$VM_NAME" --name 2>/dev/null | sed '/^$/d') && [[ -n "$snapshot_list" ]]; then
+  echo "检测到快照，删除中 ..."
+  while IFS= read -r snap; do
+    [[ -z "$snap" ]] && continue
+    virsh snapshot-delete "$VM_NAME" "$snap" --metadata --children || \
+      virsh snapshot-delete "$VM_NAME" "$snap" --children
+  done <<< "$snapshot_list"
+fi
+
 echo "虚拟机 $VM_NAME 已关闭，执行 undefine ..."
 virsh undefine "$VM_NAME" --remove-all-storage
