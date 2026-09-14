@@ -58,9 +58,39 @@ if [[ -n "$CAPACITY" ]]; then
   sudo qemu-img resize "$IMG_LIBVIRT_PATH" "$CAPACITY"
 fi
 
+# 优先使用 UEFI（由 libvirt 按固件描述符自动选择 OVMF，不硬编码路径）；
+# 主机缺少 OVMF 固件时回退到传统 BIOS。
+# 注意：不能用 "ls glob1 glob2" 整体判断——任一 glob 无匹配时 ls 退出码非 0，
+# 即使另一个路径存在也会误判。
+uefi_available() {
+  # libvirt/qemu 实际使用的固件描述符（最可靠）
+  local f
+  for f in /usr/share/qemu/firmware/*.json /etc/qemu/firmware/*.json; do
+    [[ -f "$f" ]] && grep -qi uefi "$f" && return 0
+  done
+  # 回退：直接查找各发行版常见的 OVMF 固件文件
+  for f in \
+    /usr/share/OVMF/OVMF_CODE*.fd \
+    /usr/share/edk2/ovmf/OVMF_CODE*.fd \
+    /usr/share/edk2-ovmf/x64/OVMF_CODE*.fd \
+    /usr/share/qemu/ovmf-x86_64-code.bin; do
+    [[ -e "$f" ]] && return 0
+  done
+  return 1
+}
+
+if uefi_available; then
+  BOOT_OPTS="--boot uefi"
+  echo "使用 UEFI 启动。"
+else
+  BOOT_OPTS="--boot bios"
+  echo "警告：未找到 OVMF UEFI 固件，回退到 BIOS 启动。如需 UEFI，请安装 ovmf（Debian/Ubuntu）或 edk2-ovmf（RHEL/Rocky）。" >&2
+fi
+
 sudo virt-install \
   --name "$VM_NAME" \
   --os-variant rocky10 \
+  $BOOT_OPTS \
   --memory 6144 \
   --vcpus 6 \
   --disk path="$IMG_LIBVIRT_PATH",format=qcow2,bus=virtio \
